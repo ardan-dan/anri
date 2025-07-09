@@ -1,19 +1,26 @@
+// lib/main.dart
+
+import 'package:anri/providers/ticket_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:anri/pages/splash_screen.dart';
-import 'package:intl/date_symbol_data_local.dart'; // 1. Tambahkan import ini
+import 'package:intl/date_symbol_data_local.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:provider/provider.dart'; // BARU
 
-// 2. Ubah fungsi main menjadi async
 Future<void> main() async {
-  // 3. Pastikan semua widget Flutter sudah siap sebelum menjalankan proses lain
   WidgetsFlutterBinding.ensureInitialized();
-
-  // 4. Inisialisasi (muat) data format tanggal untuk Bahasa Indonesia
   await initializeDateFormatting('id_ID', null);
-
-  runApp(const MyApp());
+  await dotenv.load(fileName: ".env");
+  
+  // DIUBAH: Bungkus aplikasi dengan Provider
+  runApp(
+    ChangeNotifierProvider(
+      create: (context) => TicketProvider(),
+      child: const MyApp(),
+    ),
+  );
 }
 
-// Widget utama aplikasi (tidak ada perubahan di sini)
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -30,7 +37,7 @@ class MyApp extends StatelessWidget {
         visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
       home: const SplashScreen(),
-      debugShowCheckedModeBanner: false, // Menghilangkan banner debug
+      debugShowCheckedModeBanner: false,
     );
   }
 }
