@@ -18,10 +18,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 }
 // --- AKHIR HEADER CORS ---
 
-// AMANKAN ENDPOINT INI
-require 'auth_check.php';
-// Memanggil file koneksi
-require 'koneksi.php';
+$response = ['success' => false, 'data' => [], 'message' => 'Gagal mengambil data tiket.'];
 
 try {
     // --- PENGATURAN PAGINATION ---
