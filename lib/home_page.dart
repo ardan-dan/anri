@@ -1,18 +1,23 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:anri/config/api_config.dart';
-import 'package:anri/models/ticket_model.dart';
 import 'package:anri/pages/error_page.dart';
 import 'package:anri/pages/home/widgets/ticket_card.dart';
 import 'package:anri/pages/login_page.dart';
+import 'package:anri/pages/notification_page.dart';
 import 'package:anri/pages/profile_page.dart';
 import 'package:anri/providers/settings_provider.dart';
 import 'package:anri/providers/ticket_provider.dart';
 import 'package:anri/utils/error_handler.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+enum TicketView { all, assignedToMe }
+
+enum FabState { hidden, filter, scrollToTop }
 
 class HomePage extends StatefulWidget {
   final String currentUserName;
@@ -30,9 +35,6 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   int _selectedIndex = 0;
-  String _selectedCategory = 'All';
-  String _selectedStatus = 'New';
-  String _selectedPriority = 'All';
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
   Timer? _debounce;
@@ -40,8 +42,14 @@ class _HomePageState extends State<HomePage> {
   List<String> _teamMembers = ['Unassigned'];
 
   final ScrollController _scrollController = ScrollController();
-  final GlobalKey _headerFilterKey = GlobalKey();
-  bool _isFabVisible = false;
+  TicketView _currentView = TicketView.all;
+  FabState _fabState = FabState.hidden;
+
+  String _selectedStatus = 'New';
+  String _homeCategory = 'All';
+  String _homePriority = 'All';
+  String _historyCategory = 'All';
+  String _historyPriority = 'All';
 
   final Map<String, String> _categories = {
     'All': 'Semua Kategori',
@@ -75,7 +83,6 @@ class _HomePageState extends State<HomePage> {
     'In Progress',
     'On Hold',
   ];
-
   final List<String> _priorityDialogFilters = [
     'All',
     'Critical',
@@ -94,20 +101,32 @@ class _HomePageState extends State<HomePage> {
     });
 
     _searchController.addListener(() {
-      if (_debounce?.isActive ?? false) _debounce!.cancel();
+      if (_debounce?.isActive ?? false) {
+        _debounce!.cancel();
+      }
       _debounce = Timer(const Duration(milliseconds: 500), _triggerSearch);
     });
 
     _scrollController.addListener(() {
-      if (_scrollController.hasClients) {
-        final headerContext = _headerFilterKey.currentContext;
-        if (headerContext != null) {
-          final headerHeight = headerContext.size?.height ?? 200.0;
-          if (_scrollController.offset > headerHeight) {
-            if (!_isFabVisible) setState(() => _isFabVisible = true);
-          } else {
-            if (_isFabVisible) setState(() => _isFabVisible = false);
-          }
+      if (!_scrollController.hasClients) {
+        return;
+      }
+      final direction = _scrollController.position.userScrollDirection;
+      final offset = _scrollController.position.pixels;
+
+      if (offset < 200) {
+        if (_fabState != FabState.hidden) {
+          setState(() => _fabState = FabState.hidden);
+        }
+        return;
+      }
+      if (direction == ScrollDirection.reverse) {
+        if (_fabState != FabState.filter) {
+          setState(() => _fabState = FabState.filter);
+        }
+      } else if (direction == ScrollDirection.forward) {
+        if (_fabState != FabState.scrollToTop) {
+          setState(() => _fabState = FabState.scrollToTop);
         }
       }
     });
@@ -124,18 +143,31 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _triggerSearch() {
+    final String assigneeParam = _currentView == TicketView.assignedToMe
+        ? widget.currentUserName
+        : '';
+    final bool isHomePage = _selectedIndex == 0;
+
     context.read<TicketProvider>().fetchTickets(
       status: _getStatusForAPI(),
-      category: _selectedCategory,
+      category: isHomePage ? _homeCategory : _historyCategory,
       searchQuery: _searchController.text,
-      priority: _selectedPriority,
+      priority: isHomePage ? _homePriority : _historyPriority,
+      assignee: assigneeParam,
       isRefresh: true,
     );
   }
 
   String _getStatusForAPI() {
-    if (_selectedIndex == 1) return 'Resolved';
-    if (_selectedStatus == 'Semua Status') return 'All';
+    if (_selectedIndex == 1) {
+      return 'Resolved';
+    }
+    if (_selectedIndex == 0 && _currentView == TicketView.assignedToMe) {
+      return 'Active';
+    }
+    if (_selectedStatus == 'Semua Status') {
+      return 'All';
+    }
     return _selectedStatus;
   }
 
@@ -143,6 +175,9 @@ class _HomePageState extends State<HomePage> {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     final String? token = prefs.getString('auth_token');
     if (token == null) {
+      // --- [PERBAIKAN] use_build_context_synchronously ---
+      // Karena ini bukan method async, pemanggilan _logout aman.
+      // Namun kita akan pastikan _logout juga aman.
       if (mounted) {
         _logout(context, message: 'Sesi tidak valid. Silakan login kembali.');
       }
@@ -153,13 +188,23 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _fetchTeamMembers() async {
     final headers = await _getAuthHeaders();
-    if (headers.isEmpty || !mounted) return;
+    if (!mounted) {
+      return;
+    }
+    if (headers.isEmpty) {
+      return;
+    }
     try {
       final url = Uri.parse('${ApiConfig.baseUrl}/get_users.php');
       final response = await http
           .get(url, headers: headers)
           .timeout(const Duration(seconds: 15));
-      if (!mounted) return;
+
+      // --- [PERBAIKAN] use_build_context_synchronously ---
+      // Selalu cek 'mounted' setelah 'await' sebelum menggunakan BuildContext.
+      if (!mounted) {
+        return;
+      }
       if (response.statusCode == 401) {
         _logout(context, message: 'Sesi tidak valid.');
         return;
@@ -168,12 +213,14 @@ class _HomePageState extends State<HomePage> {
         final responseData = json.decode(response.body);
         if (responseData['success'] == true) {
           final List<dynamic> data = responseData['data'];
-          final List<String> fetchedMembers =
-              data.map((user) => user['name'].toString()).toList();
-          setState(() {
-            _teamMembers =
-                fetchedMembers.isNotEmpty ? fetchedMembers : ['Unassigned'];
-          });
+          final List<String> fetchedMembers = data
+              .map((user) => user['name'].toString())
+              .toList();
+          setState(
+            () => _teamMembers = fetchedMembers.isNotEmpty
+                ? fetchedMembers
+                : ['Unassigned'],
+          );
         }
       }
     } catch (e) {
@@ -181,9 +228,7 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // --- PERBAIKAN: use_build_context_synchronously ---
   Future<void> _logout(BuildContext context, {String? message}) async {
-    // Jalankan semua operasi async terlebih dahulu
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     final bool rememberMe = prefs.getBool('rememberMe') ?? false;
     final String? username = prefs.getString('user_username');
@@ -195,10 +240,10 @@ class _HomePageState extends State<HomePage> {
       await prefs.setString('user_username', username);
     }
 
-    // Setelah semua await selesai, baru periksa 'mounted'
-    if (!mounted) return;
-
-    // Sekarang aman untuk menggunakan BuildContext
+    // --- [PERBAIKAN] use_build_context_synchronously ---
+    if (!mounted) {
+      return;
+    }
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (context) => const LoginPage()),
@@ -213,38 +258,40 @@ class _HomePageState extends State<HomePage> {
 
   void _startAutoRefreshTimer() {
     _autoRefreshTimer?.cancel();
-    if (!mounted) return;
+    if (!mounted) {
+      return;
+    }
     final settingsProvider = context.read<SettingsProvider>();
-
     if (settingsProvider.refreshInterval == Duration.zero) {
       debugPrint("Auto refresh is OFF");
       return;
     }
+    _autoRefreshTimer = Timer.periodic(settingsProvider.refreshInterval, (
+      timer,
+    ) {
+      final bool shouldRefresh =
+          _selectedIndex != 2 &&
+          _searchController.text.isEmpty &&
+          mounted &&
+          context.read<TicketProvider>().listState != ListState.loading &&
+          !context.read<TicketProvider>().isLoadingMore;
 
-    debugPrint(
-      "Starting auto refresh timer with interval: ${settingsProvider.refreshIntervalText}",
-    );
-    _autoRefreshTimer = Timer.periodic(
-      settingsProvider.refreshInterval,
-      (timer) {
-        if (_selectedIndex != 2 &&
-            _searchController.text.isEmpty &&
-            mounted &&
-            context.read<TicketProvider>().listState != ListState.loading &&
-            !context.read<TicketProvider>().isLoadingMore) {
-          debugPrint("Auto refreshing tickets (background)...");
-          context.read<TicketProvider>().fetchTickets(
-
-            status: _getStatusForAPI(),
-            category: _selectedCategory,
-            searchQuery: _searchController.text,
-            priority: _selectedPriority,
-            isRefresh: true,
-            isBackgroundRefresh: true,
-          );
-        }
-      },
-    );
+      if (shouldRefresh) {
+        final String assigneeParam = _currentView == TicketView.assignedToMe
+            ? widget.currentUserName
+            : '';
+        final bool isHomePage = _selectedIndex == 0;
+        context.read<TicketProvider>().fetchTickets(
+          status: _getStatusForAPI(),
+          category: isHomePage ? _homeCategory : _historyCategory,
+          searchQuery: _searchController.text,
+          priority: isHomePage ? _homePriority : _historyPriority,
+          assignee: assigneeParam,
+          isRefresh: false,
+          isBackgroundRefresh: true,
+        );
+      }
+    });
   }
 
   String _getPriorityIconPath(String priority) {
@@ -258,7 +305,6 @@ class _HomePageState extends State<HomePage> {
       case 'Low':
         return 'assets/images/label-low.png';
       default:
-        // Default icon jika tidak ada yang cocok
         return 'assets/images/label-medium.png';
     }
   }
@@ -281,71 +327,74 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
-
     final pageBackgroundDecoration = BoxDecoration(
-      color: Theme.of(context).scaffoldBackgroundColor,
-      gradient: isDarkMode
-          ? null
-          : const LinearGradient(
-              colors: [
+      gradient: LinearGradient(
+        colors: isDarkMode
+            ? [
+                Theme.of(context).colorScheme.surface,
+                Theme.of(context).scaffoldBackgroundColor,
+              ]
+            : [
                 Colors.white,
-                Color(0xFFE0F2F7),
-                Color(0xFFBBDEFB),
+                const Color(0xFFE0F2F7),
+                const Color(0xFFBBDEFB),
                 Colors.blueAccent,
               ],
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-            ),
-    );
-
-    return Scaffold(
-      appBar: AppBar(
-        title: _buildAppBarTitle(),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        actions: _selectedIndex == 0
-            ? [
-                Center(
-                  child: Padding(
-                    padding: const EdgeInsets.only(right: 16.0),
-                    child: Text(
-                      'Hi, ${widget.currentUserName}',
-                      style: const TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                ),
-              ]
-            : null,
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
       ),
+    );
+    return Scaffold(
+      appBar: _selectedIndex != 2
+          ? AppBar(
+              title: _buildAppBarTitle(),
+              actions: _selectedIndex == 0
+                  ? [
+                      IconButton(
+                        icon: const Icon(Icons.notifications_none_outlined),
+                        tooltip: 'Notifikasi',
+                        onPressed: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => const NotificationPage(),
+                          ),
+                        ),
+                      ),
+                      Center(
+                        child: Padding(
+                          padding: const EdgeInsets.only(right: 16.0),
+                          child: Text(
+                            'Hi, ${widget.currentUserName}',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ),
+                    ]
+                  : null,
+            )
+          : null,
       body: Stack(
         children: [
-          Container(
-            decoration: _selectedIndex != 2 ? pageBackgroundDecoration : null,
-            color: _selectedIndex == 2
-                ? Theme.of(context).colorScheme.surfaceContainerLowest
-                : null,
-          ),
+          if (_selectedIndex != 2)
+            Container(decoration: pageBackgroundDecoration),
           _buildBody(),
         ],
       ),
-      extendBodyBehindAppBar: true,
-      floatingActionButton: _selectedIndex != 2 && _isFabVisible
-          ? FloatingActionButton(
-              onPressed: _showFilterDialog,
-              backgroundColor: Theme.of(context).colorScheme.primary,
-              foregroundColor: Theme.of(context).colorScheme.onPrimary,
-              child: const Icon(Icons.filter_list),
-            )
-          : null,
+      floatingActionButton: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 300),
+        transitionBuilder: (child, animation) =>
+            ScaleTransition(scale: animation, child: child),
+        child: _buildFab(),
+      ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
         onTap: (index) {
           if (_selectedIndex != index) {
-            _searchController.clear();
             setState(() {
               _selectedIndex = index;
-              _selectedCategory = 'All';
-              _selectedStatus = 'New';
+              _currentView = TicketView.all;
+              _fabState = FabState.hidden;
+              _searchController.clear();
             });
             if (index != 2) {
               _triggerSearch();
@@ -376,57 +425,99 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget _buildFab() {
+    switch (_fabState) {
+      case FabState.filter:
+        return FloatingActionButton(
+          key: const ValueKey('filter'),
+          onPressed: _showFilterDialog,
+          backgroundColor: Theme.of(context).colorScheme.primary,
+          foregroundColor: Theme.of(context).colorScheme.onPrimary,
+          tooltip: 'Filter Lanjutan',
+          child: const Icon(Icons.filter_list),
+        );
+      case FabState.scrollToTop:
+        return FloatingActionButton(
+          key: const ValueKey('scrollToTop'),
+          onPressed: () => _scrollController.animateTo(
+            0,
+            duration: const Duration(milliseconds: 500),
+            curve: Curves.easeInOut,
+          ),
+          tooltip: 'Kembali ke Atas',
+          backgroundColor: Theme.of(context).colorScheme.primary,
+          foregroundColor: Theme.of(context).colorScheme.onPrimary,
+          child: const Icon(Icons.arrow_upward),
+        );
+      // --- [PERBAIKAN] Menghapus 'default' yang redudan ---
+      case FabState.hidden:
+        return const SizedBox.shrink(key: ValueKey('hidden'));
+    }
+  }
+
   Widget _buildBody() {
     switch (_selectedIndex) {
       case 0:
       case 1:
-        return Padding(
-          padding: EdgeInsets.only(
-            top: kToolbarHeight + MediaQuery.of(context).padding.top,
-          ),
-          child: Column(
-            children: [
-              _buildHeaderFilterBar(),
-              Expanded(
-                child: Consumer<TicketProvider>(
-                  builder: (context, provider, child) {
-                    switch (provider.listState) {
-                      case ListState.loading:
-                        return const Center(child: CircularProgressIndicator());
-                      case ListState.error:
-                        return _buildErrorState(provider.errorMessage);
-                      case ListState.empty:
-                        return _buildEmptyState();
-                      case ListState.hasData:
-                        return RefreshIndicator(
-                          onRefresh: () async => _triggerSearch(),
-                          child: ListView.builder(
-                            controller: _scrollController,
-                            padding: const EdgeInsets.fromLTRB(0, 0, 0, 80),
-                            itemCount: provider.tickets.length +
-                                (provider.hasMore ? 1 : 0),
-                            itemBuilder: (context, index) {
-                              if (index < provider.tickets.length) {
-                                final ticket = provider.tickets[index];
-                                return TicketCard(
-                                  ticket: ticket,
-                                  allCategories: _categories.entries
-                                      .where((e) => e.key != 'All')
-                                      .map((e) => e.value)
-                                      .toList(),
-                                  allTeamMembers: _teamMembers,
-                                  currentUserName: widget.currentUserName,
-                                  onRefresh: _triggerSearch,
-                                );
-                              } else {
-                                return _buildPaginationControl(provider);
-                              }
-                            },
-                          ),
-                        );
-                    }
-                  },
-                ),
+        return RefreshIndicator(
+          onRefresh: () async {
+            if (_fabState != FabState.hidden) {
+              await _scrollController.animateTo(
+                0,
+                duration: const Duration(milliseconds: 300),
+                curve: Curves.easeOut,
+              );
+            }
+            _triggerSearch();
+          },
+          child: CustomScrollView(
+            controller: _scrollController,
+            slivers: [
+              SliverToBoxAdapter(child: _buildHeaderFilterBar()),
+              Consumer<TicketProvider>(
+                builder: (context, provider, child) {
+                  switch (provider.listState) {
+                    case ListState.loading:
+                      return const SliverFillRemaining(
+                        child: Center(child: CircularProgressIndicator()),
+                      );
+                    case ListState.error:
+                      return SliverFillRemaining(
+                        child: _buildErrorState(provider.errorMessage),
+                      );
+                    case ListState.empty:
+                      return SliverFillRemaining(
+                        hasScrollBody: false,
+                        child: _buildEmptyState(),
+                      );
+                    case ListState.hasData:
+                      return SliverList(
+                        delegate: SliverChildBuilderDelegate(
+                          (context, index) {
+                            if (index < provider.tickets.length) {
+                              final ticket = provider.tickets[index];
+                              return TicketCard(
+                                key: ValueKey(ticket.id),
+                                ticket: ticket,
+                                allCategories: _categories.entries
+                                    .where((e) => e.key != 'All')
+                                    .map((e) => e.value)
+                                    .toList(),
+                                allTeamMembers: _teamMembers,
+                                currentUserName: widget.currentUserName,
+                                onRefresh: _triggerSearch,
+                              );
+                            } else {
+                              return _buildPaginationControl(provider);
+                            }
+                          },
+                          childCount:
+                              provider.tickets.length +
+                              (provider.hasMore ? 1 : 0),
+                        ),
+                      );
+                  }
+                },
               ),
             ],
           ),
@@ -467,8 +558,28 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildHeaderFilterBar() {
+    final ticketProvider = context.watch<TicketProvider>();
+    final ButtonStyle segmentedButtonStyle = ButtonStyle(
+      backgroundColor: WidgetStateProperty.resolveWith<Color?>(
+        (states) => states.contains(WidgetState.selected)
+            ? Theme.of(context).colorScheme.primary
+            : Theme.of(context).colorScheme.surfaceContainerHighest,
+      ),
+      foregroundColor: WidgetStateProperty.resolveWith<Color?>(
+        (states) => states.contains(WidgetState.selected)
+            ? Theme.of(context).colorScheme.onPrimary
+            : Theme.of(context).colorScheme.primary,
+      ),
+      side: WidgetStateProperty.all(
+        BorderSide(color: Theme.of(context).colorScheme.primary.withAlpha(128)),
+      ),
+      shape: WidgetStateProperty.all(
+        RoundedRectangleBorder(borderRadius: BorderRadius.circular(12.0)),
+      ),
+    );
+
     return Container(
-      key: _headerFilterKey,
+      key: const ValueKey<int>(1),
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -492,16 +603,48 @@ class _HomePageState extends State<HomePage> {
                       borderRadius: BorderRadius.circular(12),
                       borderSide: BorderSide.none,
                     ),
-                    fillColor:
-                        Theme.of(context).colorScheme.surfaceContainerHighest,
+                    fillColor: Theme.of(
+                      context,
+                    ).colorScheme.surfaceContainerHighest,
                     filled: true,
-                    contentPadding:
-                        const EdgeInsets.symmetric(horizontal: 16),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16),
                   ),
                   onSubmitted: (value) => _triggerSearch(),
                 ),
               ),
               const SizedBox(width: 8),
+              IconButton(
+                icon: AnimatedRotation(
+                  turns: ticketProvider.currentSortType == SortType.byPriority
+                      ? 0.5
+                      : 0,
+                  duration: const Duration(milliseconds: 300),
+                  child: Icon(
+                    Icons.swap_vert,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+                onPressed: () {
+                  final message =
+                      ticketProvider.currentSortType == SortType.byDate
+                      ? 'Urutan diubah berdasarkan Prioritas'
+                      : 'Urutan diubah berdasarkan Terbaru';
+                  ticketProvider.toggleSort();
+                  _triggerSearch();
+                  ScaffoldMessenger.of(context)
+                    ..hideCurrentSnackBar()
+                    ..showSnackBar(
+                      SnackBar(
+                        content: Text(message),
+                        duration: const Duration(seconds: 2),
+                      ),
+                    );
+                },
+                tooltip: ticketProvider.currentSortType == SortType.byDate
+                    ? 'Urutkan berdasarkan Prioritas'
+                    : 'Urutkan berdasarkan Terbaru',
+                iconSize: 28,
+              ),
               IconButton(
                 icon: Icon(
                   Icons.filter_list_alt,
@@ -513,10 +656,34 @@ class _HomePageState extends State<HomePage> {
               ),
             ],
           ),
-          if (_selectedIndex == 0) ...[
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<TicketView>(
+              style: segmentedButtonStyle,
+              segments: const <ButtonSegment<TicketView>>[
+                ButtonSegment<TicketView>(
+                  value: TicketView.all,
+                  label: Text('Semua Tiket'),
+                  icon: Icon(Icons.list_alt),
+                ),
+                ButtonSegment<TicketView>(
+                  value: TicketView.assignedToMe,
+                  label: Text('Untuk Saya'),
+                  icon: Icon(Icons.person),
+                ),
+              ],
+              selected: {_currentView},
+              onSelectionChanged: (newSelection) {
+                setState(() => _currentView = newSelection.first);
+                _triggerSearch();
+              },
+            ),
+          ),
+          if (_selectedIndex == 0 && _currentView == TicketView.all) ...[
             const SizedBox(height: 16),
             Text(
-              'Status',
+              'Status Cepat',
               style: TextStyle(
                 color: Theme.of(context).textTheme.bodySmall?.color,
                 fontWeight: FontWeight.bold,
@@ -527,52 +694,35 @@ class _HomePageState extends State<HomePage> {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: _statusHeaderFilters.map((status) {
-                  final isSelected = _selectedStatus == status;
-                  final isDarkMode =
-                      Theme.of(context).brightness == Brightness.dark;
                   return Padding(
                     padding: const EdgeInsets.only(right: 8.0),
                     child: ChoiceChip(
                       label: Text(status),
-                      selected: isSelected,
+                      selected: _selectedStatus == status,
                       onSelected: (selected) {
                         if (selected) {
                           setState(() => _selectedStatus = status);
                           _triggerSearch();
                         }
                       },
-                      selectedColor:
-                          Theme.of(context).colorScheme.primaryContainer,
-                      backgroundColor:
-                          Theme.of(context).colorScheme.surfaceContainerHighest,
+                      selectedColor: Theme.of(
+                        context,
+                      ).colorScheme.primaryContainer,
+                      backgroundColor: Theme.of(
+                        context,
+                      ).colorScheme.surfaceContainerHighest,
                       labelStyle: TextStyle(
-                        color: isSelected
-                            ? isDarkMode
-                                ? Theme.of(context)
-                                    .colorScheme
-                                    .onPrimaryContainer
-                                : Theme.of(context).colorScheme.primary
+                        color: _selectedStatus == status
+                            ? Theme.of(context).colorScheme.onPrimaryContainer
                             : Theme.of(context).textTheme.bodyLarge?.color,
                         fontWeight: FontWeight.w500,
                       ),
                       side: BorderSide(
-                        color: isSelected
-                            ? isDarkMode
-                                ? Theme.of(context)
-                                    .colorScheme
-                                    .primaryContainer
-                                    .withAlpha(150)
-                                // --- PERBAIKAN: deprecated_member_use ---
-                                : Theme.of(context)
-                                    .colorScheme
-                                    .primary
-                                    .withAlpha(128) // Menggunakan withAlpha
-                            : isDarkMode
-                                ? Theme.of(context)
-                                    .colorScheme
-                                    .outline
-                                    .withAlpha(50)
-                                : Colors.grey.shade300,
+                        color: _selectedStatus == status
+                            ? Colors.transparent
+                            : Theme.of(
+                                context,
+                              ).colorScheme.outline.withAlpha(51),
                       ),
                     ),
                   );
@@ -587,19 +737,26 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _showFilterDialog() {
-    String tempCategory = _selectedCategory;
+    final bool isHomePage = _selectedIndex == 0;
+    String tempCategory = isHomePage ? _homeCategory : _historyCategory;
     String tempStatus = _selectedStatus;
-    String tempPriority = _selectedPriority; 
-
+    String tempPriority = isHomePage ? _homePriority : _historyPriority;
     Color getStatusColor(String status) {
       switch (status) {
-        case 'New': return const Color(0xFFD32F2F);
-        case 'Waiting Reply': return const Color(0xFFE65100);
-        case 'Replied': return const Color(0xFF1976D2);
-        case 'In Progress': return const Color(0xFF673AB7);
-        case 'On Hold': return const Color(0xFFC2185B);
-        case 'Resolved': return const Color(0xFF388E3C);
-        default: return Colors.grey.shade700;
+        case 'New':
+          return const Color(0xFFD32F2F);
+        case 'Waiting Reply':
+          return const Color(0xFFE65100);
+        case 'Replied':
+          return const Color(0xFF1976D2);
+        case 'In Progress':
+          return const Color(0xFF673AB7);
+        case 'On Hold':
+          return const Color(0xFFC2185B);
+        case 'Resolved':
+          return const Color(0xFF388E3C);
+        default:
+          return Colors.grey.shade700;
       }
     }
 
@@ -613,15 +770,17 @@ class _HomePageState extends State<HomePage> {
             );
             return AlertDialog(
               title: const Text('Filter Lanjutan'),
-
               contentPadding: const EdgeInsets.fromLTRB(24.0, 20.0, 24.0, 24.0),
               content: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    if (_selectedIndex == 0) ...[
-                      Text('Status', style: Theme.of(context).textTheme.bodySmall),
+                    if (isHomePage) ...[
+                      Text(
+                        'Status',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
                       const SizedBox(height: 4),
                       DropdownButtonFormField<String>(
                         value: tempStatus,
@@ -644,15 +803,17 @@ class _HomePageState extends State<HomePage> {
                           );
                         }).toList(),
                         onChanged: (newValue) {
-                          if (newValue != null)
+                          if (newValue != null) {
                             setDialogState(() => tempStatus = newValue);
+                          }
                         },
                       ),
                       const SizedBox(height: 16),
                     ],
-
-                    // Dropdown Prioritas
-                    Text('Prioritas', style: Theme.of(context).textTheme.bodySmall),
+                    Text(
+                      'Prioritas',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                     const SizedBox(height: 4),
                     DropdownButtonFormField<String>(
                       value: tempPriority,
@@ -662,9 +823,9 @@ class _HomePageState extends State<HomePage> {
                       ),
                       items: _priorityDialogFilters.map((priority) {
                         if (priority == 'All') {
-                          return DropdownMenuItem<String>(
-                            value: priority,
-                            child: const Text('Semua Prioritas'),
+                          return const DropdownMenuItem<String>(
+                            value: 'All',
+                            child: Text('Semua Prioritas'),
                           );
                         }
                         return DropdownMenuItem<String>(
@@ -673,7 +834,8 @@ class _HomePageState extends State<HomePage> {
                             children: [
                               Image.asset(
                                 _getPriorityIconPath(priority),
-                                width: 16, height: 16,
+                                width: 16,
+                                height: 16,
                                 color: _getPriorityColor(priority),
                               ),
                               const SizedBox(width: 8),
@@ -695,8 +857,10 @@ class _HomePageState extends State<HomePage> {
                       },
                     ),
                     const SizedBox(height: 16),
-                    
-                    Text('Kategori', style: Theme.of(context).textTheme.bodySmall),
+                    Text(
+                      'Kategori',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                     const SizedBox(height: 4),
                     DropdownButtonFormField<String>(
                       value: tempCategory,
@@ -705,15 +869,21 @@ class _HomePageState extends State<HomePage> {
                         border: OutlineInputBorder(),
                         contentPadding: EdgeInsets.symmetric(horizontal: 12),
                       ),
-                      items: _categories.entries.map((entry) => 
-                        DropdownMenuItem<String>(
-                          value: entry.key,
-                          child: Text(entry.value, overflow: TextOverflow.ellipsis),
-                        )
-                      ).toList(),
+                      items: _categories.entries
+                          .map(
+                            (entry) => DropdownMenuItem<String>(
+                              value: entry.key,
+                              child: Text(
+                                entry.value,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          )
+                          .toList(),
                       onChanged: (newValue) {
-                        if (newValue != null)
+                        if (newValue != null) {
                           setDialogState(() => tempCategory = newValue);
+                        }
                       },
                     ),
                   ],
@@ -728,9 +898,14 @@ class _HomePageState extends State<HomePage> {
                       onPressed: () {
                         Navigator.of(context).pop();
                         setState(() {
-                          _selectedCategory = tempCategory;
-                          _selectedStatus = tempStatus;
-                          _selectedPriority = tempPriority;
+                          if (isHomePage) {
+                            _homeCategory = tempCategory;
+                            _homePriority = tempPriority;
+                            _selectedStatus = tempStatus;
+                          } else {
+                            _historyCategory = tempCategory;
+                            _historyPriority = tempPriority;
+                          }
                         });
                         _triggerSearch();
                       },
@@ -741,17 +916,14 @@ class _HomePageState extends State<HomePage> {
                     OutlinedButton(
                       onPressed: () {
                         setDialogState(() {
-                          if (_selectedIndex == 0) {
-                            final bool isHeaderFilterActive = _statusHeaderFilters.contains(_selectedStatus);
-                            tempStatus = isHeaderFilterActive ? _selectedStatus : 'New';
+                          if (isHomePage) {
+                            tempStatus = 'New';
                           }
-                          // Selalu reset prioritas dan kategori
-                          tempPriority = 'All'; 
+                          tempPriority = 'All';
                           tempCategory = 'All';
                         });
                       },
-                      style:
-                          OutlinedButton.styleFrom(shape: buttonShape),
+                      style: OutlinedButton.styleFrom(shape: buttonShape),
                       child: const Text('Atur Ulang'),
                     ),
                   ],
@@ -766,41 +938,42 @@ class _HomePageState extends State<HomePage> {
 
   Widget _buildEmptyState() {
     bool isSearching = _searchController.text.isNotEmpty;
-    return SingleChildScrollView(
-      child: Padding(
+    return Center(
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 48.0),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // DIUBAH: Ukuran ikon diperkecil
             Icon(
-              isSearching ? Icons.search_off : Icons.inbox_outlined,
+              _currentView == TicketView.assignedToMe
+                  ? Icons.person_search_outlined
+                  : (isSearching ? Icons.search_off : Icons.inbox_outlined),
               size: 60,
               color: Colors.grey.shade400,
             ),
-            // DIUBAH: Jarak vertikal dikurangi
             const SizedBox(height: 12),
-            // DIUBAH: Ukuran font judul diperkecil
             Text(
-              isSearching ? 'Tiket Tidak Ditemukan' : 'Tidak Ada Tiket',
+              _currentView == TicketView.assignedToMe
+                  ? 'Tidak Ada Tiket Untuk Anda'
+                  : (isSearching ? 'Tiket Tidak Ditemukan' : 'Tidak Ada Tiket'),
               style: TextStyle(
                 fontSize: 20,
                 fontWeight: FontWeight.bold,
                 color: Colors.grey.shade600,
               ),
             ),
-            // DIUBAH: Jarak vertikal dikurangi
             const SizedBox(height: 6),
-            // DIUBAH: Ukuran font sub-judul diperkecil
             Text(
-              isSearching
+              _currentView == TicketView.assignedToMe
+                  ? 'Tidak ada tiket yang saat ini ditugaskan kepada Anda dengan filter yang aktif.'
+                  : isSearching
                   ? 'Tidak ada tiket yang cocok dengan pencarian "${_searchController.text}".'
                   : 'Belum ada tiket yang cocok dengan filter yang aktif.',
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 14, color: Colors.grey.shade500),
             ),
             if (isSearching) ...[
-              // DIUBAH: Jarak vertikal dikurangi
               const SizedBox(height: 20),
               ElevatedButton.icon(
                 icon: const Icon(Icons.arrow_back),
@@ -822,8 +995,7 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.wifi_off_outlined,
-                size: 80, color: Colors.red.shade300),
+            Icon(Icons.wifi_off_outlined, size: 80, color: Colors.red.shade300),
             const SizedBox(height: 16),
             const Text(
               'Gagal Memuat Data',
@@ -844,22 +1016,21 @@ class _HomePageState extends State<HomePage> {
             ),
             const SizedBox(height: 12),
             TextButton.icon(
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => ErrorPage(
-                      message: errorInfo.userMessage,
-                      referenceCode: errorInfo.referenceCode,
-                    ),
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => ErrorPage(
+                    message: errorInfo.userMessage,
+                    referenceCode: errorInfo.referenceCode,
                   ),
-                );
-              },
+                ),
+              ),
               icon: const Icon(Icons.info_outline),
               label: const Text('Lihat Detail Error'),
-              style:
-                  TextButton.styleFrom(foregroundColor: Colors.grey.shade700),
-            )
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.grey.shade700,
+              ),
+            ),
           ],
         ),
       ),
@@ -878,18 +1049,24 @@ class _HomePageState extends State<HomePage> {
       child: Center(
         child: FilledButton.icon(
           onPressed: () {
+            final String assigneeParam = _currentView == TicketView.assignedToMe
+                ? widget.currentUserName
+                : '';
+            final bool isHomePage = _selectedIndex == 0;
             context.read<TicketProvider>().loadMoreTickets(
               status: _getStatusForAPI(),
-              category: _selectedCategory,
+              category: isHomePage ? _homeCategory : _historyCategory,
               searchQuery: _searchController.text,
-              priority: _selectedPriority, // <-- TAMBAHKAN INI
+              priority: isHomePage ? _homePriority : _historyPriority,
+              assignee: assigneeParam,
             );
           },
           icon: const Icon(Icons.add_circle_outline),
           label: const Text('Tampilkan Lebih Banyak'),
           style: FilledButton.styleFrom(
-            backgroundColor:
-                Theme.of(context).colorScheme.surfaceContainerHighest,
+            backgroundColor: Theme.of(
+              context,
+            ).colorScheme.surfaceContainerHighest,
             foregroundColor: Theme.of(context).colorScheme.primary,
             elevation: 1,
           ),

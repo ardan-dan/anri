@@ -1,135 +1,84 @@
 <?php
 /**
- * anri_helpdesk_api/add_reply.php
- * Skrip untuk menambahkan balasan dari aplikasi mobile dan mengirim notifikasi email.
+ * add_reply.php
+ * VERSI BERSIH - Memanggil Pusat Notifikasi
  */
 
-// Mulai output buffering untuk menangkap semua kemungkinan output liar
 ob_start();
 
-// --- PENGATURAN PENTING ---
-// Tentukan path relatif dari file API ini ke folder instalasi utama HESK Anda.
-// Contoh: Jika folder API ada di dalam /hesk/api/, maka path-nya adalah '../'
-define('IN', 1);
-define('HESK_PATH', 'hesk/'); // <-- SESUAIKAN PATH INI
+require 'koneksi.php';
+require 'auth_check.php';
+require 'notification_email.php'; // Panggil file notifikasi kita
 
-// --- MULAI INTEGRASI DENGAN HESK ---
-// Sertakan file pengaturan dan fungsi inti dari HESK
-// Ini penting untuk bisa menggunakan fungsi notifikasi email bawaan HESK.
-require(HESK_PATH . 'hesk_settings.inc.php');
-require(HESK_PATH . 'inc/common.inc.php');
-// --- AKHIR INTEGRASI DENGAN HESK ---
-
-// Sertakan file otentikasi dan koneksi kustom Anda
-require 'auth_check.php'; // Memastikan staf yang login valid
-require 'koneksi.php';    // Koneksi ke database (menggunakan file kustom Anda)
-
-// --- HEADER CORS UNTUK MENGIZINKAN AKSES DARI FLUTTER WEB ---
 header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
+header("Access-Control-Allow-Methods: POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization");
-
-// Menangani Pre-flight Request (penting untuk browser)
-if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
-    http_response_code(200);
-    ob_end_flush();
-    exit();
-}
-
-// Atur header default sebagai JSON
+if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') { http_response_code(200); exit(); }
 header('Content-Type: application/json');
-$response = ['success' => false, 'message' => 'Terjadi kesalahan yang tidak diketahui.'];
 
-// Nonaktifkan sementara fungsi notifikasi HESK agar tidak berjalan dua kali
-$hesk_settings['notify_new_reply'] = 0;
+$response = ['success' => false, 'message' => 'Terjadi kesalahan.'];
 
 try {
-    // Mengambil data dari request POST
-    $ticket_id = isset($_POST['ticket_id']) ? intval($_POST['ticket_id']) : 0;
-    $message = isset($_POST['message']) ? hesk_input(trim($_POST['message'])) : '';
-    $new_status_text = isset($_POST['new_status']) ? trim($_POST['new_status']) : '';
-    $staff_id = isset($_POST['staff_id']) ? intval($_POST['staff_id']) : 1;
-    $staff_name = isset($_POST['staff_name']) ? hesk_input(trim($_POST['staff_name'])) : 'Administrator';
+    // ... (Bagian mengambil data POST dan operasi database tetap sama) ...
+    $ticket_id  = isset($_POST['ticket_id']) ? intval($_POST['ticket_id']) : 0;
+    $message    = isset($_POST['message']) ? trim($_POST['message']) : '';
+    $status_txt = isset($_POST['new_status']) ? trim($_POST['new_status']) : '';
+    $staff_id   = isset($_POST['staff_id']) ? intval($_POST['staff_id']) : 1;
+    $staff_name = isset($_POST['staff_name']) ? trim($_POST['staff_name']) : 'Administrator';
 
-    // Validasi input
-    if (empty($ticket_id) || empty($message) || empty($new_status_text)) {
-        throw new Exception('Data tidak lengkap (ticket_id, message, new_status).');
+    if (!$ticket_id || empty($message) || empty($status_txt)) {
+        throw new Exception('Data yang dikirim tidak lengkap.');
     }
 
-    $status_map = [
-        'New' => 0, 'Waiting Reply' => 1, 'Replied' => 2,
-        'Resolved' => 3, 'In Progress' => 4, 'On Hold' => 5,
-    ];
-
-    if (!array_key_exists($new_status_text, $status_map)) {
-        throw new Exception('Status balasan tidak valid.');
-    }
-
-    $new_status_id = $status_map[$new_status_text];
-
-    // Memulai transaction
     mysqli_begin_transaction($conn);
 
-    // 1. Masukkan balasan ke tabel hesk_replies
-    $sql_reply = "INSERT INTO `hesk_replies` (`replyto`, `name`, `message`, `message_html`, `dt`, `staffid`) VALUES (?, ?, ?, ?, NOW(), ?)";
+    $sql_reply = "INSERT INTO `hesk_replies` (`replyto`, `name`, `message`, `dt`, `staffid`) VALUES (?, ?, ?, NOW(), ?)";
     $stmt_reply = mysqli_prepare($conn, $sql_reply);
-    mysqli_stmt_bind_param($stmt_reply, 'isssi', $ticket_id, $staff_name, $message, $message, $staff_id);
-    if (!mysqli_stmt_execute($stmt_reply)) {
-        throw new Exception("Gagal menyimpan balasan: " . mysqli_stmt_error($stmt_reply));
-    }
-    mysqli_stmt_close($stmt_reply);
+    mysqli_stmt_bind_param($stmt_reply, 'issi', $ticket_id, $staff_name, $message, $staff_id);
+    mysqli_stmt_execute($stmt_reply);
 
-    // 2. Update tiket di tabel hesk_tickets
-    $sql_ticket = "UPDATE `hesk_tickets` SET 
-                    `status` = ?, 
-                    `lastchange` = NOW(), 
-                    `replies` = `replies` + 1, 
-                    `staffreplies` = `staffreplies` + 1,
-                    `lastreplier` = '1', 
-                    `replierid` = ?
-                   WHERE `id` = ?";
-    $stmt_ticket = mysqli_prepare($conn, $sql_ticket);
-    mysqli_stmt_bind_param($stmt_ticket, 'iii', $new_status_id, $staff_id, $ticket_id);
-    if (!mysqli_stmt_execute($stmt_ticket)) {
-        throw new Exception("Gagal memperbarui tiket: " . mysqli_stmt_error($stmt_ticket));
-    }
-    mysqli_stmt_close($stmt_ticket);
+    $status_map = ['New'=>0, 'Waiting Reply'=>1, 'Replied'=>2, 'Resolved'=>3, 'In Progress'=>4, 'On Hold'=>5];
+    $new_status_id = $status_map[$status_txt];
+    $sql_update = "UPDATE `hesk_tickets` SET `status`=?, `lastchange`=NOW(), `replies`=`replies`+1, `staffreplies`=`staffreplies`+1, `lastreplier`='1', `replierid`=? WHERE `id`=?";
+    $stmt_update = mysqli_prepare($conn, $sql_update);
+    mysqli_stmt_bind_param($stmt_update, 'iii', $new_status_id, $staff_id, $ticket_id);
+    mysqli_stmt_execute($stmt_update);
 
-    // Jika semua berhasil, commit transaction
+    $sql_info = "SELECT `trackid`, `name` AS customer_name, `email` AS customer_email, `subject` FROM `hesk_tickets` WHERE `id` = ? LIMIT 1";
+    $stmt_info = mysqli_prepare($conn, $sql_info);
+    mysqli_stmt_bind_param($stmt_info, 'i', $ticket_id);
+    mysqli_stmt_execute($stmt_info);
+    $ticket_info = mysqli_fetch_assoc(mysqli_stmt_get_result($stmt_info));
+
     mysqli_commit($conn);
 
-    // --- BLOK BARU: Pemicu Notifikasi Email via HESK ---
-    // Ambil detail tiket lengkap yang diperlukan untuk notifikasi email
-    $sql_ticket_info = "SELECT * FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."tickets` WHERE `id` = ".intval($ticket_id)." LIMIT 1";
-    $res_ticket_info = hesk_dbQuery($sql_ticket_info);
+    // --- KIRIM NOTIFIKASI ---
+    if ($ticket_info) {
+        $hesk_url = rtrim($_ENV['HESK_URL'] ?? 'http://localhost/hesk', '/');
+        $tracking_url = $hesk_url . '/ticket.php?track=' . $ticket_info['trackid'] . '&e=' . rawurlencode($ticket_info['customer_email']);
 
-    if (hesk_dbNumRows($res_ticket_info) == 1) {
-        $ticket = hesk_dbFetchAssoc($res_ticket_info);
-        // Panggil fungsi notifikasi email bawaan HESK
-        hesk_notify_customer_new_reply($ticket, $message, $staff_name);
+        $subject = ' [#' . $ticket_info['trackid'] .']'.'New reply to:' . $ticket_info['subject'];
+        $body    = "<p>Dear " . htmlspecialchars($ticket_info['customer_name']) . ",</p>"
+                 . "<p>We have just replied to your ticket \"" . htmlspecialchars($ticket_info['subject']) . "\".</p>"
+                 . "<p>Isi balasan:<br>" . nl2br(htmlspecialchars($message)) . "</p>"
+                 . "<p>To read the message, submit a reply and view details, please visit:<br>"
+                 . "<a href=\"$tracking_url\">$tracking_url</a></p>"
+                 . "<p>Sincerely,<br>Help Desk Mobile</p>";
+
+        // Panggil fungsi dari pusat notifikasi
+        send_notification_email($ticket_info['customer_email'], $ticket_info['customer_name'], $subject, $body);
     }
-    // --- AKHIR BLOK BARU ---
-
-    $response['success'] = true;
-    $response['message'] = 'Balasan berhasil dikirim dan notifikasi email telah diproses.';
+    
+    $response = ['success' => true, 'message' => 'Balasan berhasil disimpan dan notifikasi sedang diproses.'];
 
 } catch (Exception $e) {
-    // Jika ada error di mana pun, batalkan semua perubahan
-    mysqli_rollback($conn);
-    http_response_code(500); // Set kode error server
-    $response['success'] = false;
+    if ($conn) mysqli_rollback($conn);
+    http_response_code(500);
     $response['message'] = 'Gagal memproses balasan: ' . $e->getMessage();
 }
 
-// Bersihkan semua output yang mungkin sudah ada
-ob_clean();
-
-// Cetak response sebagai JSON murni
+if ($conn) mysqli_close($conn);
+ob_end_clean();
 echo json_encode($response);
-
-// Tutup koneksi database
-mysqli_close($conn);
-
-// Hentikan eksekusi skrip
 exit();
 ?>
